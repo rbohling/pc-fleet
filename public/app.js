@@ -1,0 +1,50 @@
+import {barcode} from './barcode.js';
+const $=s=>document.querySelector(s),el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
+let state={assets:[],events:[],revision:0},selected=new Set(),submit;
+const notice=m=>{$('#notice').textContent=m;$('#notice').hidden=!m;};
+async function load(){try{const r=await fetch('/api/state');if(!r.ok)throw Error((await r.json()).error);state=await r.json();render();notice('');}catch(e){notice(e.message);}}
+async function post(path,body){const r=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,revision:state.revision})});const data=await r.json();if(!r.ok){if(r.status===409)await load();throw Error(data.error);}state=data;render();}
+const visible=()=>state.assets.filter(a=>(!$('#filter').value||a.status===$('#filter').value)&&[a.tag,a.serial,a.model,a.assignedTo,a.location].some(v=>v.toLowerCase().includes($('#search').value.trim().toLowerCase())));
+function render(){
+  const today=new Date().toLocaleDateString('en-CA');
+  $('#total').textContent=state.assets.length;$('#available').textContent=state.assets.filter(a=>a.status==='Available').length;$('#out').textContent=state.assets.filter(a=>a.status==='Checked out').length;$('#attention').textContent=state.assets.filter(a=>a.status==='Maintenance'||(a.status==='Checked out'&&a.dueDate&&a.dueDate<today)).length;
+  const list=visible();$('#rows').replaceChildren();
+  for(const a of list){const tr=el('tr'),td=el('td'),cb=el('input');cb.type='checkbox';cb.checked=selected.has(a.id);cb.setAttribute('aria-label','Select '+a.tag);cb.onchange=()=>{cb.checked?selected.add(a.id):selected.delete(a.id);updateSelect();};td.append(cb);tr.append(td);
+    const name=el('td');name.append(el('span',a.tag,'tag'),el('small',a.model));tr.append(name,el('td',a.serial||'—'));
+    const status=el('td');status.append(el('span',a.status,'badge '+a.status.replaceAll(' ','')));if(a.dueDate)status.append(el('small','Due '+a.dueDate));tr.append(status,el('td',a.assignedTo||'—'),el('td',a.location||'—'));
+    const actions=el('td'),btn=el('button','Manage →');btn.onclick=()=>manage(a);actions.append(btn);tr.append(actions);$('#rows').append(tr);
+  }
+  $('#empty').hidden=list.length>0;if(!list.length){$('#empty h2').textContent=state.assets.length?'No PCs match your search':'Your inventory starts here';$('#empty p').textContent=state.assets.length?'Try another barcode, search term, or status.':'Add your first PC or import your fleet from a CSV file.';$('#emptyAdd').hidden=state.assets.length>0;}
+  $('#count').textContent=`${list.length} of ${state.assets.length} PCs`;
+  $('#events').replaceChildren();for(const e of state.events){const n=el('div',undefined,'event');n.append(el('strong',`${e.tag} · ${e.action}`),el('p',e.details),el('small',`${new Date(e.at).toLocaleString()} · ${e.actor}`));$('#events').append(n);}if(!state.events.length)$('#events').append(el('div','No activity yet. Your changes will appear here.','event'));updateSelect();
+}
+function updateSelect(){const list=visible();$('#selectAll').checked=list.length>0&&list.every(a=>selected.has(a.id));$('#selectAll').indeterminate=list.some(a=>selected.has(a.id))&&!$('#selectAll').checked;}
+function field(label,name,value='',type='text',required=false){const l=el('label',label),input=el(type==='textarea'?'textarea':'input');input.name=name;if(type!=='textarea')input.type=type;input.value=value;input.required=required;input.maxLength=name==='notes'?2000:name==='tag'?30:200;l.append(input);return l;}
+function dialog(title,fields,fn,save='Save'){$('#dialogTitle').textContent=title;$('#fields').replaceChildren(...fields);$('#formError').textContent='';$('#form button[type=submit]').textContent=save;$('#form button[type=submit]').hidden=!fn;submit=fn;$('#dialog').showModal();}
+function edit(a){dialog(a?'Edit '+a.tag:'Add a PC',[field('Asset tag (e.g. PC-001)','tag',a?.tag||nextTag(),'text',true),field('Model','model',a?.model||'','text',true),field('Serial number','serial',a?.serial),field('Location','location',a?.location),field('Notes','notes',a?.notes,'textarea')],async data=>post(a?'edit':'assets',a?{id:a.id,asset:data}:{asset:data}));}
+function nextTag(){let n=1;while(state.assets.some(a=>a.tag===`PC-${String(n).padStart(3,'0')}`))n++;return `PC-${String(n).padStart(3,'0')}`;}
+function manage(a){const summary=el('p',`${a.model} · ${a.serial||'No serial'} · ${a.location||'No location'}`),status=el('p',a.status+(a.assignedTo?' · '+a.assignedTo:'')),buttons=el('div',undefined,'tools');
+  const add=(text,fn)=>{const b=el('button',text);b.type='button';b.onclick=()=>{$('#dialog').close();fn();};buttons.append(b);};
+  add('Edit PC',()=>edit(a));add('Print label',()=>printLabels([a]));
+  if(a.status==='Available')add('Check out',()=>dialog('Check out '+a.tag,[field('Assigned user','assignedTo','','text',true),field('Location','location',a.location),field('Expected return (optional)','dueDate','','date')],async data=>post('checkout',{id:a.id,...data}),'Check out'));
+  if(a.status==='Checked out')add('Check in',()=>dialog('Check in '+a.tag,[el('p','Returning from '+a.assignedTo),field('Return location','location',a.location,'text',true)],async data=>post('checkin',{id:a.id,...data}),'Check in'));
+  if(a.status!=='Checked out'){const select=el('select');select.setAttribute('aria-label','New status');for(const s of ['Available','Maintenance','Retired']){const o=el('option',s);o.selected=s===a.status;select.append(o);}buttons.append(select);add('Set status',async()=>{try{await post('status',{id:a.id,status:select.value});}catch(e){notice(e.message);}});}
+  const history=el('div');for(const e of state.events.filter(e=>e.assetId===a.id).slice(0,20)){history.append(el('p',`${new Date(e.at).toLocaleString()} · ${e.action} · ${e.details}`));}
+  dialog(a.tag,[summary,status,el('p',a.notes),buttons,el('h3','Recent history'),history],null);
+}
+$('#form').onsubmit=async e=>{e.preventDefault();const b=$('#form button[type=submit]');b.disabled=true;try{await submit(Object.fromEntries(new FormData(e.target)));$('#dialog').close();notice('');}catch(error){$('#formError').textContent=error.message;}finally{b.disabled=false;}};
+$('#close').onclick=$('#cancel').onclick=()=>$('#dialog').close();$('#add').onclick=$('#emptyAdd').onclick=()=>edit();
+$('#search').oninput=$('#filter').onchange=render;$('#search').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();const tag=e.target.value.trim().toUpperCase(),a=state.assets.find(a=>a.tag===tag||a.serial.toUpperCase()===tag);if(a)manage(a);else notice('No matching PC. Add it to inventory first.');}};
+$('#scan').onclick=()=>{$('#search').focus();$('#search').select();};$('#selectAll').onchange=e=>{visible().forEach(a=>e.target.checked?selected.add(a.id):selected.delete(a.id));render();};
+function printLabels(assets){if(!assets.length)return notice('Select PCs using the checkboxes before printing labels.');const area=$('#printArea');area.replaceChildren();for(const a of assets){const label=el('div',undefined,'label');label.append(el('small','IT ASSET · PC FLEET'),barcode(a.tag),el('strong',a.tag),el('small',a.model));area.append(label);}window.print();}
+$('#labels').onclick=()=>printLabels(state.assets.filter(a=>selected.has(a.id)));
+function download(name,data,type){const url=URL.createObjectURL(new Blob([data],{type})),a=el('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+const csvCell=v=>{let s=String(v??'');if(/^[=+@\-\t\r]/.test(s))s="'"+s;return '"'+s.replaceAll('"','""')+'"';};
+function csv(rows,keys){return [keys,...rows.map(r=>keys.map(k=>r[k]??''))].map(r=>r.map(csvCell).join(',')).join('\r\n');}
+$('#export').onclick=()=>download('pc-inventory.csv',csv(state.assets,['tag','model','serial','location','status','assignedTo','dueDate','notes']),'text/csv');
+$('#historyExport').onclick=()=>download('pc-history.csv',csv(state.events,['at','tag','action','details','actor']),'text/csv');
+$('#backup').onclick=()=>download('pc-fleet-backup-'+new Date().toISOString().slice(0,10)+'.json',JSON.stringify(state,null,2),'application/json');
+export function parseCSV(text){const rows=[];let row=[],cell='',quoted=false;for(let i=0;i<text.length;i++){const c=text[i];if(c==='"'){if(quoted&&text[i+1]==='"'){cell+='"';i++;}else if(!quoted&&cell.length)throw Error('Invalid CSV quoting');else quoted=!quoted;}else if(c===','&&!quoted){row.push(cell);cell='';}else if((c==='\n'||c==='\r')&&!quoted){if(c==='\r'&&text[i+1]==='\n')i++;row.push(cell);if(row.some(v=>v.length))rows.push(row);row=[];cell='';}else cell+=c;}if(quoted)throw Error('Unclosed quote in CSV');row.push(cell);if(row.some(v=>v.length))rows.push(row);return rows;}
+$('#import').onclick=()=>$('#csvFile').click();$('#csvFile').onchange=async e=>{try{const f=e.target.files[0];if(!f)return;if(f.size>1_000_000)throw Error('CSV must be under 1 MB.');const rows=parseCSV((await f.text()).replace(/^\uFEFF/,''));if(!rows.length)throw Error('CSV is empty.');const keys=rows.shift().map(k=>k.trim());if(!keys.includes('tag')||!keys.includes('model'))throw Error('CSV headers must include tag and model. Optional: serial, location, notes.');const assets=rows.map((r,i)=>{if(r.length!==keys.length)throw Error('Wrong column count on row '+(i+2));return Object.fromEntries(keys.map((k,j)=>[k,r[j]]));});dialog('Import '+assets.length+' PCs',[el('p','All imported PCs start as Available with no assigned user. Use check-out to assign them. Duplicate tags or serials reject the entire import.')],async()=>post('import',{assets}),'Import PCs');}catch(error){notice(error.message);}finally{e.target.value='';}};
+for(const [id,history] of [['inventoryNav',false],['historyNav',true]])$('#'+id).onclick=()=>{$('#inventory').hidden=history;$('#history').hidden=!history;$('#inventoryNav').classList.toggle('active',!history);$('#historyNav').classList.toggle('active',history);$('#breadcrumb').textContent=history?'Activity history':'Inventory';};
+await load();

@@ -1,0 +1,42 @@
+import {test,after} from 'node:test';
+import assert from 'node:assert/strict';
+import {spawn} from 'node:child_process';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {once} from 'node:events';
+const dir=await mkdtemp(join(tmpdir(),'pc-fleet-')),port=33191;
+let child;
+async function start(){child=spawn(process.execPath,['server.mjs'],{env:{...process.env,NODE_ENV:'test',PORT:String(port),DATA_FILE:join(dir,'test.sqlite')},stdio:['ignore','pipe','pipe']});for(let i=0;i<100;i++){try{const r=await fetch(`http://127.0.0.1:${port}/api/state`);if(r.ok)return;}catch{}await new Promise(r=>setTimeout(r,50));}throw Error('Server did not start');}
+await start();
+after(async()=>{if(child.exitCode===null){child.kill();await once(child,'exit');}await rm(dir,{recursive:true,force:true});});
+let state=await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();
+async function post(path,data,expected=200){const r=await fetch(`http://127.0.0.1:${port}/api/${path}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.revision,...data})});const b=await r.json();assert.equal(r.status,expected,JSON.stringify(b));if(r.ok)state=b;return b;}
+test('inventory lifecycle, validation, concurrency, import atomicity, and restart persistence',async()=>{
+ assert.equal(state.assets.length,0);
+ await post('assets',{asset:{tag:'PC-001',model:'Dell',serial:'ABC',location:'Office'}});
+ const id=state.assets[0].id;
+ await post('assets',{asset:{tag:'PC-001',model:'Other'}},409);
+ await post('assets',{asset:{tag:'PC-002',model:'Other',serial:'abc'}},409);
+ await post('assets',{asset:{tag:'bad tag',model:'Other'}},400);
+ await post('checkout',{id,assignedTo:''},400);
+ await post('checkout',{id,assignedTo:'Alex',dueDate:'2026-02-30'},400);
+ await post('checkout',{id,assignedTo:'Alex',location:'HQ',dueDate:'2026-12-31'});
+ assert.equal(state.assets[0].status,'Checked out');assert.equal(state.assets[0].assignedTo,'Alex');
+ await post('checkout',{id,assignedTo:'Someone else'},409);
+ await post('status',{id,status:'Retired'},409);
+ await post('edit',{id,asset:{tag:'PC-001',model:'Dell updated',serial:'ABC',location:'HQ'}});
+ assert.equal(state.assets[0].assignedTo,'Alex');
+ await post('checkin',{id,location:'IT storage'});
+ assert.equal(state.assets[0].assignedTo,'');assert.equal(state.assets[0].dueDate,'');
+ await post('checkin',{id},409);
+ await post('status',{id,status:'Maintenance'});
+ await post('checkout',{id,assignedTo:'Alex'},409);
+ await post('status',{id,status:'Available',revision:0},409);
+ await post('import',{assets:[{tag:'PC-002',model:'Lenovo'},{tag:'PC-001',model:'Duplicate'}]},409);
+ const fresh=await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();assert.equal(fresh.assets.length,1);
+ await post('import',{assets:[{tag:'PC-002',model:'Lenovo'},{tag:'PC-003',model:'HP'}]});assert.equal(state.assets.length,3);
+ const hostile=await fetch(`http://127.0.0.1:${port}/api/assets`,{method:'POST',headers:{'Content-Type':'application/json','Origin':'https://evil.example'},body:'{}'});assert.equal(hostile.status,403);
+ assert.equal(state.events.filter(e=>e.action==='Checked out').length,1);
+ child.kill();await once(child,'exit');await start();const persisted=await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();assert.deepEqual(persisted,state);
+});
